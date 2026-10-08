@@ -5,9 +5,10 @@ abstract = """
   This Google Summer of Code 2026 project added the data-parallel primitives that
   the Julia GPU stack was missing and tuned them to serve as the shared
   implementation for every backend. The work was merged as 15 pull requests in
-  AcceleratedKernels.jl 0.5. A benchmark on an NVIDIA RTX 5080 shows each operation
-  across three stages: the pre-GSoC CPU fallback, the existing CUDA.jl GPU path, and
-  the new AcceleratedKernels.jl kernels."""
+  AcceleratedKernels.jl 0.5. Each operation is benchmarked on an NVIDIA RTX 5080 against
+  the pre-GSoC AK release and the CUDA.jl vendor path, showing real speedups where a
+  better algorithm applies, new functionality where AK had nothing before, and parity
+  on the bandwidth-bound operations."""
 +++
 
 {{abstract}}
@@ -72,93 +73,103 @@ atomic histograms, chunked scatter), added a `BitonicSort` network for short sli
 and added a segmented `RadixSort` path for sorting along `dims` whose cost depends
 little on slice length. The `Auto()` selector chooses between them per input.
 
-**Benchmarking.** Each operation was measured three ways on the same data, to show the
-state of the stack before this work and after it. The GPU runs were on an NVIDIA RTX
-5080, timed on the device with `CUDA.@elapsed`, taking the minimum of 12 runs, warmed,
+**Benchmarking.** Each operation was measured on the same data on an NVIDIA RTX 5080,
+timed on the device with `CUDA.@elapsed`, taking the minimum of 12 runs, warmed,
 refreshing the input each iteration for mutating operations, and using AK's default
-settings with no per-device tuning. The CPU runs used single-threaded Julia on the
-host, timed with the minimum of a few warmed runs. The results per operation follow.
+settings with no per-device tuning. To show the effect of the work honestly, each
+operation is compared against the state of AcceleratedKernels before the project (the
+v0.4.3 release, profiled on the same machine) and against the CUDA.jl vendor path. The
+results per operation follow.
 
 ## Results by operation
 
 In every chart, lower time is better, and both axes use a logarithmic scale unless
-noted. The three series read left to right as the history of the operation:
+noted. The series are:
 
-- **Before GSoC (CPU fallback):** the result on a GPU backend that had no kernel for
-  the operation. Before this work, several of these operations had no portable GPU
-  implementation in the shared layer, so that case fell back to single-threaded CPU
-  execution (or failed outright). This line is that CPU fallback, and it marks the
-  starting point the project improved on.
-- **CUDA.jl (vendor GPU):** the GPU implementation that already shipped for CUDA,
-  reached by calling the standard function (`sort!`, `sortperm`, `cumsum!`, `sum`,
-  `findall`, `reverse!`, `map!`) on a `CuArray`, through CUDA.jl and GPUArrays.jl.
-- **AK (this work):** the AcceleratedKernels.jl kernel added during this project, which
-  is the single portable implementation every backend can now use.
+- **Before GSoC (AK v0.4.3):** the state of AcceleratedKernels before this work. For
+  the operations AK already had (`sort`, `sortperm`, `reduce`, `accumulate`, `map`, and
+  reduction along `dims`), this is the pre-GSoC AK kernel. For `reverse` and `findall`,
+  AK had no kernel at all before this project, so there is no pre-GSoC AK line and the
+  before-state is the CUDA.jl path shown instead.
+- **CUDA.jl:** the vendor GPU implementation that already shipped, reached by calling
+  the standard function on a `CuArray` (through CUDA.jl and GPUArrays.jl).
+- **AK (this work):** the current AcceleratedKernels.jl kernel.
 
-So the three lines show the path from the pre-GSoC fallback, to the existing vendor GPU
-code, to the portable AK kernels.
+Being candid about the result: pre-GSoC AK was already a capable library, so for some
+operations the honest outcome is a clear speedup, for others it is new functionality
+that did not exist before, and for the bandwidth-bound operations it is parity with no
+regression. Each case is called out below.
 
 ### Sort
 
-For a flat `Int32` array, `AK Auto` is about 5 to 7 times faster than the CUDA.jl sort
-across the mid to large sizes, and the explicit `RadixSort` reaches about 15 times
-faster at 128M elements. The gap grows with size, because the comparison sort in
-CUDA.jl grows faster than the radix path.
+Pre-GSoC AK already had a `MergeSort` that was well ahead of the CUDA.jl sort (about 6
+to 7 times faster at large sizes). The contribution here is the new `RadixSort`, which
+is about twice as fast as the old `MergeSort` on large integer arrays (at 128M `Int32`,
+83 ms for `MergeSort` versus 39 ms for `RadixSort`), plus a `BitonicSort` for short
+slices and the `Auto` selector. `Auto` currently tracks the merge path at these `Int32`
+sizes, so `RadixSort` is the fast option to pick explicitly.
 
-{{img "sort.png" "Flat Int32 sort time versus array size for CUDA.jl, AK Auto, and AK RadixSort"}}
+{{img "sort.png" "Flat Int32 sort time versus array size: pre-GSoC MergeSort, CUDA.jl, AK Auto, and AK RadixSort"}}
 
 ### sortperm
 
-The CUDA.jl `sortperm` is slow, so the portable path shows a large difference here,
-roughly 10 to 25 times faster depending on size.
+`sortperm` is faster than pre-GSoC AK by about 1.5 times at large sizes (191 ms to 125
+ms at 128M `Int32`), and both are far ahead of the CUDA.jl `sortperm`, which is slow on
+the GPU.
 
-{{img "sortperm.png" "Flat Int32 sortperm time versus array size for CUDA.jl and AK Auto"}}
+{{img "sortperm.png" "Flat Int32 sortperm time versus array size: pre-GSoC AK, CUDA.jl, and AK"}}
 
 ### accumulate
 
-For a `Float32` cumulative sum, AK is about 1.6 to 9 times faster than the CUDA.jl
-scan, with the larger difference at the mid sizes.
+The scan rework is a clear win. The `Float32` cumulative sum is about 2 to 3 times
+faster than pre-GSoC AK (7.6 ms to 2.7 ms at 128M), and faster than the CUDA.jl scan
+across sizes.
 
-{{img "accumulate.png" "Float32 cumsum time versus array size for CUDA.jl and AK"}}
+{{img "accumulate.png" "Float32 cumsum time versus array size: pre-GSoC AK, CUDA.jl, and AK"}}
 
 ### reduce and mapreduce
 
 A whole-array reduction reads the input a fixed number of times, so it is limited by
-memory bandwidth. AK and CUDA.jl are at parity here, and within measurement noise AK is
-slightly slower at a few mid sizes.
+memory bandwidth. It was already at that limit in pre-GSoC AK, so the result is parity:
+the three lines sit together, with a slight mid-size dip in the current version that is
+tracked in [#135](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/135).
 
-{{img "reduce.png" "Whole-array Float32 reduce time versus array size for CUDA.jl and AK"}}
+{{img "reduce.png" "Whole-array Float32 reduce time versus array size: pre-GSoC AK, CUDA.jl, and AK"}}
 
-Reduction along a dimension has more room, since the work can be organized to read
-memory in a coalesced order. For `dims=2` AK is faster on most shapes, by up to about
-3 times, and at parity or slightly slower on a few.
+Reduction along a dimension is close to the pre-GSoC path per shape; PR #83 mainly
+widened which dimensions and shapes are handled rather than changing the per-shape time,
+and the result stays ahead of the CUDA.jl `dims` reduction on most shapes.
 
-{{img "mapreduce_dims.png" "mapreduce along dims=2 time by array shape for CUDA.jl and AK"}}
+{{img "mapreduce_dims.png" "mapreduce along dims=2 time by array shape: pre-GSoC AK, CUDA.jl, and AK"}}
 
 ### findall
 
-Built as a scan-based stream compaction, AK is about 2 to 5 times faster than the
-CUDA.jl `findall` across result densities.
+`findall` did not exist in AK before this project; it was added as a scan-based stream
+compaction. The chart compares it against the CUDA.jl `findall` you would have used
+instead, which it matches or slightly beats across densities.
 
-{{img "findall.png" "findall time versus array size at density 0.5 for CUDA.jl and AK"}}
+{{img "findall.png" "findall time versus array size at density 0.5: CUDA.jl (before) and AK"}}
 
 ### reverse
 
-`reverse` is bandwidth-limited, so AK and the CUDA.jl `reverse!` are at parity.
+`reverse` was also new to AK. It is bandwidth-limited, so it sits at parity with the
+CUDA.jl `reverse!` that was the only option before.
 
-{{img "reverse.png" "Flat Int32 reverse time versus array size for CUDA.jl and AK"}}
+{{img "reverse.png" "Flat Int32 reverse time versus array size: CUDA.jl (before) and AK"}}
 
 ### map
 
-`map` is also bandwidth-limited, and AK is at parity with the CUDA.jl `map!`.
+Single-source `map` is bandwidth-limited and sits at parity with pre-GSoC AK and the
+CUDA.jl `map!`. The new capability here is multi-source `map` and `map!`, which did not
+exist before.
 
-{{img "map.png" "Float32 map time versus array size for CUDA.jl and AK"}}
+{{img "map.png" "Float32 map time versus array size: pre-GSoC AK, CUDA.jl, and AK"}}
 
-The pattern across the operations is consistent. The compute-bound operations (`sort`,
-`sortperm`, `accumulate`, `findall`, and reduction along a dimension) are faster
-because a work-efficient algorithm helps, while the bandwidth-bound operations
-(`reduce`, `reverse`, `map`) are at parity, which is the expected result when the
-kernel already reads the input at the memory bandwidth limit.
+Taken together, the honest summary is: a real speedup where a better algorithm applies
+(`RadixSort`, the faster scan behind `accumulate`, and `sortperm`), new functionality
+where AK had nothing before (`findall`, `reverse`, `BitonicSort`, sorting and reducing
+along `dims`, multi-source `map`), and parity with no regression on the bandwidth-bound
+operations (`reduce`, `map`), which already ran at the memory limit.
 
 ## What got merged upstream
 
