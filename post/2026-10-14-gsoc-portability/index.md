@@ -77,9 +77,10 @@ little on slice length. The `Auto()` selector chooses between them per input.
 timed on the device with `CUDA.@elapsed`, taking the minimum of 12 runs, warmed,
 refreshing the input each iteration for mutating operations, and using AK's default
 settings with no per-device tuning. To show the effect of the work honestly, each
-operation is compared against the state of AcceleratedKernels before the project (the
-v0.4.3 release, profiled on the same machine) and against the CUDA.jl vendor path. The
-results per operation follow.
+operation is compared against the state of AcceleratedKernels before the project and
+against the CUDA.jl vendor path. The "before" numbers come from checking out AK at the
+exact commit just before this work began (`bfe4d84`, the v0.4.3 line) and profiling it
+on the same machine. The results per operation follow.
 
 ## Results by operation
 
