@@ -1,102 +1,171 @@
 +++
-title = "GSoC 2026: Portable, fast data-parallel primitives for the Julia GPU stack"
+title = "GSoC 2026: Portable data-parallel primitives for the Julia GPU stack"
 author = "Shreyas Hegde"
 abstract = """
-  My Google Summer of Code 2026 project filled in the data-parallel primitives that
-  the Julia GPU stack was missing and made them fast enough to serve as the shared
-  implementation for every backend. The work landed as 15 merged pull requests in
-  AcceleratedKernels.jl 0.5, and a benchmarking campaign on an RTX 5080 shows the
-  portable kernels matching or beating the vendor and Base paths across the board."""
+  This Google Summer of Code 2026 project added the data-parallel primitives that
+  the Julia GPU stack was missing and tuned them to serve as the shared
+  implementation for every backend. The work was merged as 15 pull requests in
+  AcceleratedKernels.jl 0.5. A benchmark run on an NVIDIA RTX 5080 compares each
+  operation against the Base or vendor path."""
 +++
 
 {{abstract}}
 
 This post is my Google Summer of Code 2026 final report for [The Julia
 Language](https://julialang.org/) (JuliaGPU), mentored by Tim Besard and Christian
-Guinard. It describes what I set out to do, what got merged, the benchmark results,
-and what is left for the future.
+Guinard. It describes the project goals, what was done, what was merged, the
+benchmark results for each operation, and the work that remains.
 
 ## The problem
 
-The Julia GPU ecosystem lets you write array programs that run across NVIDIA, AMD,
-and Intel GPUs. That portability relies on `GPUArrays.jl`, which defines the common
-interface every vendor package implements. Several foundational operations, though,
-lacked a shared implementation: `reverse`, `findall`, `accumulate!`, and `mapreduce`
-either crashed on backends with no vendor override, or silently degraded to CPU
-execution by copying data back and forth. A source audit across `GPUArrays.jl`,
-`CUDA.jl`, `AMDGPU.jl`, `oneAPI.jl`, and `Metal.jl` confirmed the gaps: `reverse` and
-`findall` were absent from the shared fallback, `accumulate!` existed only as a scalar
-CPU fallback, and `mapreducedim!` was an `error("Not implemented")` stub, forcing every
-backend to carry its own vendor-specific copy.
+The Julia GPU ecosystem lets users write array programs that run on NVIDIA, AMD, and
+Intel GPUs. That portability relies on `GPUArrays.jl`, which defines the common
+interface every vendor package implements. Several common operations did not have a
+shared implementation. `reverse`, `findall`, `accumulate!`, and `mapreduce` either
+failed on backends with no vendor-specific method, or fell back to CPU execution by
+copying data to the host and back. A source review of `GPUArrays.jl`, `CUDA.jl`,
+`AMDGPU.jl`, `oneAPI.jl`, and `Metal.jl` confirmed the gaps: `reverse` and `findall`
+were missing from the shared fallback, `accumulate!` existed only as a scalar CPU
+fallback, and `mapreducedim!` was an `error("Not implemented")` stub, so each backend
+carried its own copy.
 
-The project resolves these gaps by moving the critical GPU kernels upstream into
+The project addresses these gaps by moving the kernels into
 [`AcceleratedKernels.jl`](https://github.com/JuliaGPU/AcceleratedKernels.jl) (AK),
 which is written once against `KernelAbstractions.jl` and runs on every backend, and
-by refining `GPUArrays.jl` into a thin delegation layer. Because Julia's multiple
-dispatch prefers the most specific method, routing the `AnyGPUArray` fallback to AK
-means backends that already have an optimized vendor method keep it, while backends
-missing the functionality automatically get a high-performance GPU implementation
-instead of a crash or a silent slowdown.
+by keeping `GPUArrays.jl` as a thin layer that delegates to it. Because Julia's
+multiple dispatch selects the most specific method, routing the `AnyGPUArray` fallback
+to AK means a backend that already has a vendor method keeps it, while a backend
+without one receives the AK implementation instead of an error or a host round trip.
 
 ## Project goals
 
-Together with my mentors, I set these goals:
+The goals I set with my mentors were:
 
-- Build out the missing data-parallel primitives (`reverse`, `findall`, `accumulate`,
-  `mapreduce`, and a full `sort` family) as portable AK kernels, so `GPUArrays.jl` can
-  delegate to one implementation instead of each backend maintaining its own.
-- Add dimension-wise (`dims`) support across these operations, since real array code
+- Add the missing data-parallel primitives (`reverse`, `findall`, `accumulate`,
+  `mapreduce`, and the `sort` family) as portable AK kernels, so `GPUArrays.jl` can
+  use one implementation instead of each backend maintaining its own.
+- Add dimension-wise (`dims`) support across these operations, since array code
   reduces, scans, reverses, and sorts along an axis, not only over a flat vector.
-- Optimize the kernels so the portable path matches or beats the vendor and `Base`
-  implementations, and add new sort algorithms where a single strategy does not fit
+- Tune the kernels so the portable path is at least as fast as the vendor and `Base`
+  implementations, and add further sort algorithms where one strategy does not fit
   every input shape.
-- Run a benchmarking campaign across every primitive to prove there are no regressions
-  from the portable implementations, and to find where tuning is still needed.
+- Run a benchmark across every operation to check for regressions and to find where
+  tuning is still required.
 
 ## What I did
 
-The work landed as **15 merged pull requests** and shipped in the `AcceleratedKernels.jl`
-0.5 release. AK 0.5 also reworked the host API (algorithms as values, an `Auto()`
-selector that picks a strategy per input, and explicit workspaces), so every primitive
-now presents one uniform calling convention across backends.
+The work was merged as 15 pull requests and released in `AcceleratedKernels.jl` 0.5.
+AK 0.5 also reworked the host API (algorithms passed as values, an `Auto()` selector
+that chooses a strategy per input, and explicit workspaces), so every operation now
+has one calling convention across backends.
 
-**Filling in the primitive suite.** Reductions and scans gained N-dimensional axis
+**Primitives and `dims` support.** Reductions and scans gained N-dimensional axis
 handling, `reverse` was added and then extended to arbitrary `dims`, `findall` was
-implemented from scratch as a scan-based stream compaction, and `map`/`map!` were
-generalized to several source arrays. These are exactly the operations that were
-previously absent or CPU-only in the shared layer.
+implemented as a scan-based stream compaction, and `map` and `map!` were generalized
+to several source arrays.
 
-**Sorting needed more than one algorithm.** A single comparison sort is not the right
-choice for every shape: it is excellent on short slices but scales as `L log L` on long
-ones. I added an opt-in LSD `RadixSort` and optimized it with portable, capability-gated
-tricks (a larger block size, atomic histograms, chunked scatter), added a
-vendor-agnostic `BitonicSort` network for short slices, and built a segmented
-`RadixSort` path for sorting along `dims` whose cost is largely independent of slice
-length. The `Auto()` selector then chooses between them, so users get the fastest
-strategy for their data without picking one by hand.
+**Sorting.** A single comparison sort is not the best choice for every shape, since it
+is good on short slices but grows as `L log L` on long ones. I added an opt-in LSD
+`RadixSort` and tuned it with portable, capability-gated changes (a larger block size,
+atomic histograms, chunked scatter), added a `BitonicSort` network for short slices,
+and added a segmented `RadixSort` path for sorting along `dims` whose cost depends
+little on slice length. The `Auto()` selector chooses between them per input.
 
-**A full benchmarking campaign.** Every primitive I touched was measured as a pure AK
-kernel against the `Base`/vendor path on identical data on an NVIDIA RTX 5080,
-device-timed with `CUDA.@elapsed`, min-of-12, warmed, refreshing the input each
-iteration for mutating operations, using AK's default settings with no per-device
-tuning. The headline is that the portable kernels match or beat the vendor path on
-every primitive:
+**Benchmarking.** Each operation was measured as an AK kernel against the Base or
+vendor path on the same data on an NVIDIA RTX 5080, timed on the device with
+`CUDA.@elapsed`, taking the minimum of 12 runs, warmed, refreshing the input each
+iteration for mutating operations, and using AK's default settings with no per-device
+tuning. The results per operation follow.
 
-{{img "speedups.png" "Speedup of AcceleratedKernels over the Base/vendor path across primitives on an RTX 5080"}}
+## Results by operation
 
-The pattern is clean. Compute-shaped primitives (`sort`, `sortperm`, `scan`, `findall`)
-win by large margins because the portable kernels use work-efficient algorithms, while
-the bandwidth-bound primitives (`reduce`, `reverse`, `map`) read the input a constant
-number of times and already sit at the memory ceiling, where parity is the best any
-implementation can do. Sorting is where the gap is widest, and it grows with size as
-`Base`'s comparison sort falls behind the work-efficient radix path:
+In every chart, lower time is better, and both axes use a logarithmic scale unless
+noted.
 
-{{img "sort_scaling.png" "Flat Int32 sort time versus array size: Base grows faster than AK Auto and RadixSort"}}
+### Sort
+
+For a flat `Int32` array, `AK Auto` is about 5 to 7 times faster than `Base.sort!`
+across the mid to large sizes, and the explicit `RadixSort` reaches about 15 times
+faster at 128M elements. The gap grows with size, because the comparison sort in
+`Base` grows faster than the radix path.
+
+{{img "sort.png" "Flat Int32 sort time versus array size for Base.sort!, AK Auto, and AK RadixSort"}}
+
+### sortperm
+
+`Base.sortperm` is slow on CUDA, so the portable path shows a large difference here,
+roughly 10 to 25 times faster depending on size.
+
+{{img "sortperm.png" "Flat Int32 sortperm time versus array size for Base.sortperm and AK Auto"}}
+
+### accumulate
+
+For a `Float32` cumulative sum, AK is about 1.6 to 9 times faster than `Base.cumsum!`,
+with the larger difference at the mid sizes.
+
+{{img "accumulate.png" "Float32 cumsum time versus array size for Base.cumsum! and AK"}}
+
+### reduce and mapreduce
+
+A whole-array reduction reads the input a fixed number of times, so it is limited by
+memory bandwidth. AK and `Base` are at parity here, and within measurement noise AK is
+slightly slower at a few mid sizes.
+
+{{img "reduce.png" "Whole-array Float32 reduce time versus array size for Base.sum and AK"}}
+
+Reduction along a dimension has more room, since the work can be organized to read
+memory in a coalesced order. For `dims=2` AK is faster on most shapes, by up to about
+3 times, and at parity or slightly slower on a few.
+
+{{img "mapreduce_dims.png" "mapreduce along dims=2 time by array shape for Base.sum and AK"}}
+
+### findall
+
+Built as a scan-based stream compaction, AK is about 2 to 5 times faster than
+`Base.findall` across result densities.
+
+{{img "findall.png" "findall time versus array size at density 0.5 for Base.findall and AK"}}
+
+### reverse
+
+`reverse` is bandwidth-limited, so AK and `Base.reverse!` are at parity.
+
+{{img "reverse.png" "Flat Int32 reverse time versus array size for Base.reverse! and AK"}}
+
+### map
+
+`map` is also bandwidth-limited, and AK is at parity with `Base.map!`.
+
+{{img "map.png" "Float32 map time versus array size for Base.map! and AK"}}
+
+The pattern across the operations is consistent. The compute-bound operations (`sort`,
+`sortperm`, `accumulate`, `findall`, and reduction along a dimension) are faster
+because a work-efficient algorithm helps, while the bandwidth-bound operations
+(`reduce`, `reverse`, `map`) are at parity, which is the expected result when the
+kernel already reads the input at the memory bandwidth limit.
+
+## Device-aware tuning
+
+The benchmark also showed one place where the default is not right for all hardware.
+On AMD RDNA4 the whole-array `reduce` is below the card's bandwidth at the default
+`items_per_thread = 2`. Sweeping that value shows the best setting depends on the
+device: on AMD, raising it toward 8 to 16 recovers about 1.5 times more bandwidth,
+while on NVIDIA the value of 2 is already at the knee, which is why the RTX 5080
+`reduce` is at parity.
+
+{{img "reduce_tuning.png" "Reduce bandwidth by items_per_thread at 64M elements for NVIDIA and AMD"}}
+
+A single global default is therefore not correct for a portable library. AK already
+provides the hook for a per-backend value (`reduce_tuning(::Backend, ::Type)` and
+`sort_tuning(::Backend, ::Type)`, following the `oneAPI.jl` extension's
+`predicate_tuning`), so the fix is a small per-backend override rather than a rewrite.
+The measurements are recorded in
+[#150](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/150).
 
 ## What got merged upstream
 
-Everything below is public and attributable. The table lists every pull request from
-the project and its exact status.
+The table lists the pull requests from the project and their status. All of the
+primitive work is merged and released in `AcceleratedKernels.jl` 0.5.
 
 | Repo | PR | What it does | Status |
 |------|----|--------------|--------|
@@ -115,111 +184,89 @@ the project and its exact status.
 | `AcceleratedKernels.jl` | [#129](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/129) | Segmented `RadixSort` along `dims` | Merged (0.5) |
 | `AcceleratedKernels.jl` | [#130](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/130) | Multi-source `map` / `map!` | Merged (0.5) |
 | `AMDGPU.jl` | [#1069](https://github.com/JuliaGPU/AMDGPU.jl/pull/1069) | Guard empty-array `reverse` launch | Merged |
-| `AcceleratedKernels.jl` | [#149](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/149) · [#150](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/150) | `Int32`-indexing and device-aware tuning measurements | Open issues (data recorded) |
-| `GPUArrays.jl` | #786 / #787 / #788 | Delegation layer (my first attempt) | Closed, superseded by #790 |
-| `GPUArrays.jl` | [#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790) | Route `sort` / `reduce` / `scan` / `reverse` / `findall` through AK | Open (Tim's, builds on my AK work) |
 
-The primitive work is fully merged and released in `AcceleratedKernels.jl` 0.5. The
-`GPUArrays.jl` delegation that consumes it is the one piece still open, and it is
-landing through Tim's PR rather than mine by design, since it depends on the AK 0.5
-host rework.
-
-## The one place the default is wrong: device-aware tuning
-
-The campaign surfaced a real follow-up. On AMD RDNA4 the whole-array `reduce` is
-bandwidth-starved at the default `items_per_thread = 2` (about 158 GB/s). Sweeping that
-knob shows the optimum is a property of the *device*, not the input: on AMD, raising
-`items_per_thread` toward 8 to 16 recovers up to 1.5x more bandwidth, while on NVIDIA
-the default of 2 is already at the knee, which is why the RTX 5080 `reduce` sits at
-parity.
-
-{{img "reduce_tuning.png" "Reduce bandwidth versus items_per_thread: NVIDIA is saturated at 2, AMD keeps climbing to 16"}}
-
-A single global default is therefore wrong for a portable library. AK already exposes
-the hook for the fix (`reduce_tuning(::Backend, ::Type)` and
-`sort_tuning(::Backend, ::Type)`, following the precedent of the `oneAPI.jl` extension's
-`predicate_tuning`), so the correct default per device is a small per-backend override
-rather than a rewrite. The measurements are recorded in
-[#150](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/150).
+Two measurement write-ups are recorded as open issues so the data lives in the repo:
+`Int32` indexing in [#149](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/149)
+and device-aware tuning in [#150](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/150).
+The `GPUArrays.jl` delegation that consumes this work is still open as
+[#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790); it is maintained by Tim and
+builds on the AK 0.5 host rework.
 
 ## Current state
 
 Measured against the stated goals:
 
-- **Missing primitives, as portable AK kernels** — done and merged. `reverse`,
-  `findall`, `accumulate`, `mapreduce`/`reduce`, and the full `sort`/`sortperm` family
-  all exist in AK 0.5 and run on every backend.
-- **`dims` support** — done. Reductions, scans, `reverse`, and `sort` all take `dims`.
-- **Performance parity or better** — done, and verified by the RTX 5080 campaign.
-- **No regressions / benchmarking** — done; the full sweep backs the tables above.
+- **Missing primitives as portable AK kernels:** done and merged. `reverse`,
+  `findall`, `accumulate`, `mapreduce` or `reduce`, and the `sort` and `sortperm`
+  family are in AK 0.5 and run on every backend.
+- **`dims` support:** done. Reductions, scans, `reverse`, and `sort` take `dims`.
+- **Performance at least at parity:** done, as the per-operation charts show.
+- **Regression check:** done, through the full benchmark run.
 
-The `GPUArrays.jl` delegation itself is landing through Tim's PR
+The `GPUArrays.jl` delegation is landing through
 [#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790), which depends on the AK 0.5
-host rework; once it merges, backends missing a vendor method get the AK implementation
-automatically.
+host rework. Once it merges, a backend without a vendor method uses the AK
+implementation.
 
 ## Challenges and lessons learned
 
-**Correctness on a single-pass scan needs a real device-scope fence.** The
-decoupled-lookback scan that makes `accumulate` fast is a single pass in which blocks
-read each other's partial results, so it only produces correct output if every backend
-guarantees a device-scope memory fence between the write and the read. The naive version
-passed on one backend and silently produced wrong results on another. Fixing it
-([#116](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/116)) meant implementing a
-genuine device-scope fence on all backends. The lesson: on a portable stack, a
-memory-ordering assumption that holds on one vendor is not portable until you have
-verified it on each.
+**A single-pass scan needs a real device-scope fence.** The decoupled-lookback scan
+that makes `accumulate` fast is a single pass in which blocks read each other's partial
+results, so it is correct only if every backend provides a device-scope memory fence
+between the write and the read. The first version passed on one backend and produced
+wrong results on another. The fix
+([#116](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/116)) added a real
+device-scope fence on every backend. A memory-ordering assumption that holds on one
+vendor is not portable until it is checked on each.
 
 **GPU predicates have to stay type-stable.** Building `findall` as a stream compaction
-([#115](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/115)) hit GPU-compilation
-failures whenever the predicate closure captured a `Type` or produced a type-unstable
-result. Portable GPU code is less forgiving than CPU code here, and the fix is discipline
-about what a device closure may capture.
+([#115](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/115)) failed to compile
+whenever the predicate closure captured a `Type` or returned a type-unstable value. The
+kernels had to be written so the predicate is type-stable. GPU code is less forgiving
+than CPU code here, and the fix is care about what a device closure captures.
 
-**Edge cases only show up on real hardware.** The out-of-place `reverse` crashed when
-launched on an empty array, but only on AMD, and only once I ran the tests on an actual
+**Edge cases show up only on real hardware.** The out-of-place `reverse` failed when
+launched on an empty array, but only on AMD, and only when the tests ran on an actual
 RDNA4 card ([AMDGPU.jl #1069](https://github.com/JuliaGPU/AMDGPU.jl/pull/1069)).
-Cross-backend portability work genuinely requires running on each backend.
+Portability work needs to run on each backend.
 
-**The ecosystem's own version constraints shape what you can measure.** AK 0.5 (on
+**Package version constraints affect what can be measured.** AK 0.5 (on
 KernelAbstractions 0.9) was not co-installable with the RDNA4-capable AMDGPU 2.8 (on
-KernelAbstractions 0.10), so the full AMD sweep had to be dropped and an RTX 5080 became
-the primary benchmark box. In a fast-moving package ecosystem the dependency graph is
-part of the problem.
+KernelAbstractions 0.10), so the full AMD sweep was set aside and an RTX 5080 became
+the main benchmark machine. In a fast-moving ecosystem the dependency graph is part of
+the problem.
 
-**Benchmark honestly, and trust the profiler over intuition.** Two optimizations that
-sounded obviously good, a `shfl_down` subgroup reduction and `Int32` index arithmetic,
-gave nothing once measured, because both operations are memory-bandwidth-bound rather
-than limited by the thing I was optimizing. Measuring them early is what let the project
-decide not to carry that complexity. Writing down a negative result is as valuable as
-shipping a positive one.
+**Measure before adding complexity.** Two changes that looked promising, a `shfl_down`
+subgroup reduction and `Int32` index arithmetic, gave no improvement once measured,
+because both operations are limited by memory bandwidth rather than by the part being
+changed. Measuring them early kept that complexity out of the code. A recorded negative
+result is as useful as a positive one.
 
-**The headline lesson:** portability and performance are not in tension once you pick the
-right algorithm. The compute-shaped primitives beat the vendor code precisely because one
-carefully written `KernelAbstractions.jl` kernel can use a work-efficient algorithm that
-each backend would otherwise reimplement, while the bandwidth-bound primitives already
-sit at the memory ceiling where parity is the honest best.
+The main lesson is that portability and performance are compatible once the algorithm
+fits the operation. The compute-bound operations improve because one portable kernel can
+use a work-efficient algorithm that each backend would otherwise reimplement, and the
+bandwidth-bound operations reach parity, which is the expected ceiling.
 
-## What's left
+## What is left
 
-- **Device-aware `Auto` tuning** — the main follow-up contribution. The per-backend
-  override belongs in a package extension through the `reduce_tuning`/`sort_tuning` hooks,
-  and the cleanest moment to add it is once the AK host-API redesign has landed. Data in
+- **Device-aware `Auto` tuning.** The per-backend override belongs in a package
+  extension through the `reduce_tuning` and `sort_tuning` hooks. The cleanest time to
+  add it is after the AK host-API redesign lands. Data in
   [#150](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/150).
-- **Narrow-integer (`Int32`) indexing** — being handled at the GPU compiler level (Tim) by
-  adding `llvm.assume` range hints so the compiler narrows `i64` to `i32` with no source
-  changes. In a memory-bound regime the gain is marginal; measurements in
-  [#149](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/149).
-- **Small- and whole-array reductions** — a known slowdown tracked in
-  [#135](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/135), which I am looking
-  into.
-- **GPUArrays on top of AK** — the larger direction is to build `GPUArrays.jl` on top of
-  AK so backends no longer depend on it directly; the initial PR
-  [#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790) is under evaluation.
+- **Narrow-integer (`Int32`) indexing.** This is being handled at the GPU compiler
+  level (by Tim) by adding `llvm.assume` range hints so the compiler narrows `i64` to
+  `i32` with no source changes. In a memory-bound regime the effect is small.
+  Measurements in [#149](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/149).
+- **Small and whole-array reductions.** A known slowdown is tracked in
+  [#135](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/135), which I am
+  looking into.
+- **GPUArrays on top of AK.** The larger plan is to build `GPUArrays.jl` on top of AK
+  so backends no longer depend on it directly. The first PR
+  [#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790) is under review.
 
 ## Links
 
-- `AcceleratedKernels.jl` PRs: [#83](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/83),
+- `AcceleratedKernels.jl` pull requests: [#83](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/83),
   [#90](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/90),
   [#97](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/97),
   [#102](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/102),
@@ -234,7 +281,7 @@ sit at the memory ceiling where parity is the honest best.
   [#129](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/129),
   [#130](https://github.com/JuliaGPU/AcceleratedKernels.jl/pull/130).
 - `AMDGPU.jl`: [#1069](https://github.com/JuliaGPU/AMDGPU.jl/pull/1069).
-- `GPUArrays.jl` delegation: [#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790) (Tim's, builds on the AK 0.5 host rework).
+- `GPUArrays.jl` delegation: [#790](https://github.com/JuliaGPU/GPUArrays.jl/pull/790).
 
-Thanks to Tim Besard and Christian Guinard for their mentorship throughout, and to the
-JuliaGPU community.
+Thanks to Tim Besard and Christian Guinard for their mentorship, and to the JuliaGPU
+community.
