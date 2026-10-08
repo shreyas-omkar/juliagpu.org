@@ -5,8 +5,9 @@ abstract = """
   This Google Summer of Code 2026 project added the data-parallel primitives that
   the Julia GPU stack was missing and tuned them to serve as the shared
   implementation for every backend. The work was merged as 15 pull requests in
-  AcceleratedKernels.jl 0.5. A benchmark run on an NVIDIA RTX 5080 compares each
-  operation against the current CUDA.jl implementation."""
+  AcceleratedKernels.jl 0.5. A benchmark compares each operation against
+  single-threaded CPU Julia and the current CUDA.jl GPU implementation on an
+  NVIDIA RTX 5080."""
 +++
 
 {{abstract}}
@@ -71,19 +72,28 @@ atomic histograms, chunked scatter), added a `BitonicSort` network for short sli
 and added a segmented `RadixSort` path for sorting along `dims` whose cost depends
 little on slice length. The `Auto()` selector chooses between them per input.
 
-**Benchmarking.** Each operation was measured as an AK kernel against the CUDA.jl
-implementation on the same data on an NVIDIA RTX 5080, timed on the device with
-`CUDA.@elapsed`, taking the minimum of 12 runs, warmed, refreshing the input each
-iteration for mutating operations, and using AK's default settings with no per-device
-tuning. The results per operation follow.
+**Benchmarking.** Each operation was measured three ways on the same data: as an AK
+kernel, as the CUDA.jl GPU path, and as single-threaded CPU Julia. The GPU runs were
+on an NVIDIA RTX 5080, timed on the device with `CUDA.@elapsed`, taking the minimum of
+12 runs, warmed, refreshing the input each iteration for mutating operations, and using
+AK's default settings with no per-device tuning. The CPU runs used single-threaded
+Julia (`Base`) on the host, timed with the minimum of a few warmed runs. The results
+per operation follow.
 
 ## Results by operation
 
 In every chart, lower time is better, and both axes use a logarithmic scale unless
-noted. The `CUDA.jl` series is the GPU method that runs today when the standard
-function (`sort!`, `sortperm`, `cumsum!`, `sum`, `findall`, `reverse!`, `map!`) is
-called on a `CuArray`, which goes through CUDA.jl and GPUArrays.jl. The `AK` series is
-the AcceleratedKernels.jl kernel on the same data.
+noted. The three series are:
+
+- **Base (CPU):** single-threaded CPU Julia (`sort!`, `sortperm`, `cumsum!`, `sum`,
+  `findall`, `reverse!`, `map!`) on a host `Array`. This is the slowest reference and
+  sits above the two GPU lines.
+- **CUDA.jl:** the GPU method that runs today when the same standard function is called
+  on a `CuArray`, which goes through CUDA.jl and GPUArrays.jl.
+- **AK:** the AcceleratedKernels.jl kernel.
+
+The comparison that matters for this project is `AK` against `CUDA.jl`, since both run
+on the GPU. `Base (CPU)` is included for context.
 
 ### Sort
 
