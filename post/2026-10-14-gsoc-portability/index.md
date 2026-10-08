@@ -6,7 +6,7 @@ abstract = """
   the Julia GPU stack was missing and tuned them to serve as the shared
   implementation for every backend. The work was merged as 15 pull requests in
   AcceleratedKernels.jl 0.5. A benchmark run on an NVIDIA RTX 5080 compares each
-  operation against the Base or vendor path."""
+  operation against the current CUDA.jl implementation."""
 +++
 
 {{abstract}}
@@ -71,8 +71,8 @@ atomic histograms, chunked scatter), added a `BitonicSort` network for short sli
 and added a segmented `RadixSort` path for sorting along `dims` whose cost depends
 little on slice length. The `Auto()` selector chooses between them per input.
 
-**Benchmarking.** Each operation was measured as an AK kernel against the Base or
-vendor path on the same data on an NVIDIA RTX 5080, timed on the device with
+**Benchmarking.** Each operation was measured as an AK kernel against the CUDA.jl
+implementation on the same data on an NVIDIA RTX 5080, timed on the device with
 `CUDA.@elapsed`, taking the minimum of 12 runs, warmed, refreshing the input each
 iteration for mutating operations, and using AK's default settings with no per-device
 tuning. The results per operation follow.
@@ -80,87 +80,72 @@ tuning. The results per operation follow.
 ## Results by operation
 
 In every chart, lower time is better, and both axes use a logarithmic scale unless
-noted.
+noted. The `CUDA.jl` series is the GPU method that runs today when the standard
+function (`sort!`, `sortperm`, `cumsum!`, `sum`, `findall`, `reverse!`, `map!`) is
+called on a `CuArray`, which goes through CUDA.jl and GPUArrays.jl. The `AK` series is
+the AcceleratedKernels.jl kernel on the same data.
 
 ### Sort
 
-For a flat `Int32` array, `AK Auto` is about 5 to 7 times faster than `Base.sort!`
+For a flat `Int32` array, `AK Auto` is about 5 to 7 times faster than the CUDA.jl sort
 across the mid to large sizes, and the explicit `RadixSort` reaches about 15 times
 faster at 128M elements. The gap grows with size, because the comparison sort in
-`Base` grows faster than the radix path.
+CUDA.jl grows faster than the radix path.
 
-{{img "sort.png" "Flat Int32 sort time versus array size for Base.sort!, AK Auto, and AK RadixSort"}}
+{{img "sort.png" "Flat Int32 sort time versus array size for CUDA.jl, AK Auto, and AK RadixSort"}}
 
 ### sortperm
 
-`Base.sortperm` is slow on CUDA, so the portable path shows a large difference here,
+The CUDA.jl `sortperm` is slow, so the portable path shows a large difference here,
 roughly 10 to 25 times faster depending on size.
 
-{{img "sortperm.png" "Flat Int32 sortperm time versus array size for Base.sortperm and AK Auto"}}
+{{img "sortperm.png" "Flat Int32 sortperm time versus array size for CUDA.jl and AK Auto"}}
 
 ### accumulate
 
-For a `Float32` cumulative sum, AK is about 1.6 to 9 times faster than `Base.cumsum!`,
-with the larger difference at the mid sizes.
+For a `Float32` cumulative sum, AK is about 1.6 to 9 times faster than the CUDA.jl
+scan, with the larger difference at the mid sizes.
 
-{{img "accumulate.png" "Float32 cumsum time versus array size for Base.cumsum! and AK"}}
+{{img "accumulate.png" "Float32 cumsum time versus array size for CUDA.jl and AK"}}
 
 ### reduce and mapreduce
 
 A whole-array reduction reads the input a fixed number of times, so it is limited by
-memory bandwidth. AK and `Base` are at parity here, and within measurement noise AK is
+memory bandwidth. AK and CUDA.jl are at parity here, and within measurement noise AK is
 slightly slower at a few mid sizes.
 
-{{img "reduce.png" "Whole-array Float32 reduce time versus array size for Base.sum and AK"}}
+{{img "reduce.png" "Whole-array Float32 reduce time versus array size for CUDA.jl and AK"}}
 
 Reduction along a dimension has more room, since the work can be organized to read
 memory in a coalesced order. For `dims=2` AK is faster on most shapes, by up to about
 3 times, and at parity or slightly slower on a few.
 
-{{img "mapreduce_dims.png" "mapreduce along dims=2 time by array shape for Base.sum and AK"}}
+{{img "mapreduce_dims.png" "mapreduce along dims=2 time by array shape for CUDA.jl and AK"}}
 
 ### findall
 
-Built as a scan-based stream compaction, AK is about 2 to 5 times faster than
-`Base.findall` across result densities.
+Built as a scan-based stream compaction, AK is about 2 to 5 times faster than the
+CUDA.jl `findall` across result densities.
 
-{{img "findall.png" "findall time versus array size at density 0.5 for Base.findall and AK"}}
+{{img "findall.png" "findall time versus array size at density 0.5 for CUDA.jl and AK"}}
 
 ### reverse
 
-`reverse` is bandwidth-limited, so AK and `Base.reverse!` are at parity.
+`reverse` is bandwidth-limited, so AK and the CUDA.jl `reverse!` are at parity.
 
-{{img "reverse.png" "Flat Int32 reverse time versus array size for Base.reverse! and AK"}}
+{{img "reverse.png" "Flat Int32 reverse time versus array size for CUDA.jl and AK"}}
 
 ### map
 
-`map` is also bandwidth-limited, and AK is at parity with `Base.map!`.
+`map` is also bandwidth-limited, and AK is at parity with the CUDA.jl `map!`.
 
-{{img "map.png" "Float32 map time versus array size for Base.map! and AK"}}
+{{img "map.png" "Float32 map time versus array size for CUDA.jl and AK"}}
 
 The pattern across the operations is consistent. The compute-bound operations (`sort`,
 `sortperm`, `accumulate`, `findall`, and reduction along a dimension) are faster
 because a work-efficient algorithm helps, while the bandwidth-bound operations
 (`reduce`, `reverse`, `map`) are at parity, which is the expected result when the
 kernel already reads the input at the memory bandwidth limit.
-
-## Device-aware tuning
-
-The benchmark also showed one place where the default is not right for all hardware.
-On AMD RDNA4 the whole-array `reduce` is below the card's bandwidth at the default
-`items_per_thread = 2`. Sweeping that value shows the best setting depends on the
-device: on AMD, raising it toward 8 to 16 recovers about 1.5 times more bandwidth,
-while on NVIDIA the value of 2 is already at the knee, which is why the RTX 5080
-`reduce` is at parity.
-
-{{img "reduce_tuning.png" "Reduce bandwidth by items_per_thread at 64M elements for NVIDIA and AMD"}}
-
-A single global default is therefore not correct for a portable library. AK already
-provides the hook for a per-backend value (`reduce_tuning(::Backend, ::Type)` and
-`sort_tuning(::Backend, ::Type)`, following the `oneAPI.jl` extension's
-`predicate_tuning`), so the fix is a small per-backend override rather than a rewrite.
-The measurements are recorded in
-[#150](https://github.com/JuliaGPU/AcceleratedKernels.jl/issues/150).
 
 ## What got merged upstream
 
